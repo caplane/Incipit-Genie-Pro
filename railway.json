@@ -1,0 +1,31 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "NIXPACKS",
+    "buildCommand": "pip install -r requirements.txt"
+  },
+  "deploy": {
+    "startCommand": "gunicorn citationparserapp:app --bind 0.0.0.0:$PORT --workers 4 --timeout 120",
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10,
+    "healthcheckPath": "/",
+    "healthcheckTimeout": 100
+  },
+  "envVars": {
+    "PYTHON_VERSION": "3.11",
+    "PORT": {
+      "default": "5000"
+    },
+    "SECRET_KEY": {
+      "default": "",
+      "description": "Flask secret key for sessions (will be auto-generated if not set)"
+    },
+    "MAX_CONTENT_LENGTH": {
+      "default": "104857600",
+      "description": "Maximum file upload size in bytes (default: 100MB)"
+    },
+    "FLASK_ENV": {
+      "default": "production"
+    }
+  }
+}

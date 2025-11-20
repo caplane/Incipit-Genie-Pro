@@ -1,0 +1,13 @@
+# Core Flask dependencies
+Flask==3.0.0
+Werkzeug==3.0.1
+
+# Additional dependencies for production
+gunicorn==21.2.0
+python-dotenv==1.0.0
+
+# Optional: For enhanced performance
+markupsafe==2.1.3
+itsdangerous==2.1.2
+click==8.1.7
+blinker==1.7.0
