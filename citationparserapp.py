@@ -1,327 +1,512 @@
-#!/usr/bin/env python3
-"""
-Large File Optimization Fixes for Incipit Genie Pro v3.3
-Addresses memory issues and performance bottlenecks
-"""
-
-import xml.etree.ElementTree as ET
-from xml.etree.ElementTree import iterparse
+import os
 import zipfile
-import io
-import gc
-import logging
+import shutil
+import tempfile
+import re
+import json
+import requests
+import uuid
+import xml.dom.minidom as minidom
+from flask import Flask, render_template, request, jsonify, send_file, session, redirect, url_for
+from werkzeug.utils import secure_filename
+from pathlib import Path
+from datetime import datetime
+from urllib.parse import urlparse, unquote
 
-logger = logging.getLogger(__name__)
+# ============= REMOVED ADVANCED SEARCH IMPORTS (they don't exist) =============
+# Commented out to fix Railway deployment
+# from advanced_search_module import (
+#     AdvancedCitationSearch,
+#     CitationValidator,
+#     CitationExporter
+# )
+# from concurrent.futures import ThreadPoolExecutor
 
-# FIX 1: Replace the Unicode bug (CRITICAL!)
-def clean_text_formatting(self, text):
-    """Fixed version without Unicode escape bug"""
-    text = re.sub(r'(?<=[\s(,])p{1,2}\.\s*(?=\d)', '', text)
-    text = re.sub(r'(\d)-(\d)', r'\1–\2', text)  # Use literal en-dash!
-    return text.strip()
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'production-key-v19-style-preservation'
 
+# ============= REMOVED ADVANCED SEARCH INITIALIZATION =============
+# These modules don't exist, commenting out
+# advanced_searcher = AdvancedCitationSearch()
+# citation_validator = CitationValidator()
 
-# FIX 2: Streaming XML parser for large documents
-def process_large_document_streaming(doc_path, endnotes_path, word_count=3):
-    """
-    Stream-process large documents without loading entire XML into memory
-    """
-    contexts = {}
-    endnotes = {}
-    
-    # Stream process document.xml for incipits
-    logger.info("Streaming document.xml for incipits...")
-    incipit_count = 0
-    
-    for event, elem in iterparse(doc_path, events=('start', 'end')):
-        if event == 'end' and elem.tag.endswith('}p'):
-            # Process paragraph
-            text_parts = []
-            endnote_refs = []
-            
-            for child in elem.iter():
-                if child.tag.endswith('}t'):
-                    if child.text:
-                        text_parts.append(child.text)
-                elif child.tag.endswith('}endnoteReference'):
-                    e_id = child.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}id')
-                    if e_id:
-                        endnote_refs.append((e_id, len(''.join(text_parts))))
-            
-            # Extract incipits for this paragraph
-            if endnote_refs:
-                full_text = ''.join(text_parts)
-                for e_id, position in endnote_refs:
-                    incipit = extract_incipit_at_position(full_text, position, word_count)
-                    contexts[e_id] = incipit
-                    incipit_count += 1
-                    
-                    if incipit_count % 50 == 0:
-                        logger.info(f"Processed {incipit_count} incipits...")
-            
-            # Clear element to save memory
-            elem.clear()
-            while elem.getprevious() is not None:
-                del elem.getparent()[0]
-    
-    # Stream process endnotes.xml
-    logger.info("Streaming endnotes.xml...")
-    endnote_count = 0
-    
-    for event, elem in iterparse(endnotes_path, events=('start', 'end')):
-        if event == 'end' and elem.tag.endswith('}endnote'):
-            e_id = elem.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}id')
-            
-            if e_id and e_id not in ['0', '-1']:
-                # Extract text from endnote
-                text_parts = []
-                for t_elem in elem.iter():
-                    if t_elem.tag.endswith('}t'):
-                        if t_elem.text:
-                            text_parts.append(t_elem.text)
-                
-                endnotes[e_id] = ''.join(text_parts)
-                endnote_count += 1
-                
-                if endnote_count % 50 == 0:
-                    logger.info(f"Processed {endnote_count} endnotes...")
-            
-            # Clear element to save memory
-            elem.clear()
-            while elem.getprevious() is not None:
-                del elem.getparent()[0]
-    
-    logger.info(f"Streaming complete: {incipit_count} incipits, {endnote_count} endnotes")
-    return contexts, endnotes
+# Directory settings
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'docx'}
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# FIX 3: Chunked processing for very large files
-def process_in_chunks(endnotes, chunk_size=100):
-    """
-    Process endnotes in chunks to avoid memory issues
-    """
-    from itertools import islice
-    
-    def chunk_dict(data, chunk_size):
-        it = iter(data)
-        while True:
-            chunk = dict(islice(data.items(), chunk_size))
-            if not chunk:
-                break
-            yield chunk
-    
-    processed_notes = {}
-    cit_manager = CitationManager()
-    
-    for i, chunk in enumerate(chunk_dict(endnotes, chunk_size)):
-        logger.info(f"Processing chunk {i+1} ({len(chunk)} notes)...")
+def extract_docx_structure(file_path):
+    """Extract content structure from DOCX with preserved paragraph and character styles"""
+    temp_dir = tempfile.mkdtemp()
+    try:
+        with zipfile.ZipFile(file_path, 'r') as zip_ref:
+            zip_ref.extractall(temp_dir)
         
-        for note_id, note_text in chunk.items():
-            try:
-                processed = cit_manager.process(note_text)
-                processed_notes[note_id] = processed
-            except Exception as e:
-                logger.warning(f"Failed to process note {note_id}: {e}")
-                processed_notes[note_id] = note_text
+        # Parse document.xml
+        doc_path = os.path.join(temp_dir, 'word', 'document.xml')
+        with open(doc_path, 'r', encoding='utf-8') as f:
+            content = f.read()
         
-        # Force garbage collection after each chunk
-        gc.collect()
-    
-    return processed_notes
-
-
-# FIX 4: Add file size check and warning
-def check_file_size(file_path):
-    """
-    Check file size and warn for large files
-    """
-    import os
-    size_mb = os.path.getsize(file_path) / (1024 * 1024)
-    
-    if size_mb > 50:
-        logger.warning(f"Large file detected: {size_mb:.1f} MB")
-        logger.info("Switching to streaming mode for better performance...")
-        return True, size_mb
-    
-    return False, size_mb
-
-
-# FIX 5: Progress callback for user feedback
-class ProgressTracker:
-    """
-    Track processing progress for large files
-    """
-    def __init__(self, total_items):
-        self.total = total_items
-        self.current = 0
-        self.last_percent = 0
-    
-    def update(self, increment=1):
-        self.current += increment
-        percent = int((self.current / self.total) * 100)
+        # Parse endnotes.xml if exists
+        endnotes_path = os.path.join(temp_dir, 'word', 'endnotes.xml')
+        endnotes_content = ""
+        if os.path.exists(endnotes_path):
+            with open(endnotes_path, 'r', encoding='utf-8') as f:
+                endnotes_content = f.read()
         
-        if percent > self.last_percent and percent % 10 == 0:
-            logger.info(f"Progress: {percent}% complete ({self.current}/{self.total})")
-            self.last_percent = percent
-    
-    def complete(self):
-        logger.info(f"Processing complete: {self.current} items processed")
+        # Parse styles.xml if exists  
+        styles_path = os.path.join(temp_dir, 'word', 'styles.xml')
+        styles_content = ""
+        if os.path.exists(styles_path):
+            with open(styles_path, 'r', encoding='utf-8') as f:
+                styles_content = f.read()
+        
+        return {
+            'document': content,
+            'endnotes': endnotes_content,
+            'styles': styles_content,
+            'temp_dir': temp_dir
+        }
+    except Exception as e:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise e
 
-
-# FIX 6: Optimized convert function for large files
-def convert_docx_optimized(input_path, output_path, word_count=3, format_bold=True, apply_cms=True):
-    """
-    Optimized version that handles large files efficiently
-    """
-    import tempfile
-    from pathlib import Path
-    import shutil
-    import uuid
+def parse_citations(endnotes_xml):
+    """Parse citations from endnotes.xml"""
+    if not endnotes_xml:
+        return []
     
-    temp_dir = Path(tempfile.gettempdir()) / f"proc_{uuid.uuid4().hex}"
-    os.makedirs(temp_dir, exist_ok=True)
+    # Extract endnote text content
+    endnotes = []
+    
+    # Find all endnote entries
+    endnote_pattern = r'<w:endnote[^>]*w:id="(\d+)"[^>]*>(.*?)</w:endnote>'
+    matches = re.finditer(endnote_pattern, endnotes_xml, re.DOTALL)
+    
+    for match in matches:
+        note_id = match.group(1)
+        note_content = match.group(2)
+        
+        # Skip separator and continuation notes
+        if note_id in ['-1', '0']:
+            continue
+        
+        # Extract text from the note
+        text_pattern = r'<w:t[^>]*>([^<]+)</w:t>'
+        texts = re.findall(text_pattern, note_content)
+        full_text = ''.join(texts)
+        
+        if full_text.strip():
+            endnotes.append({
+                'id': note_id,
+                'text': full_text.strip(),
+                'original_xml': note_content
+            })
+    
+    return endnotes
+
+def identify_citation_type(citation_text):
+    """Identify the type and structure of a citation"""
+    result = {
+        'type': 'unknown',
+        'components': {},
+        'confidence': 0
+    }
+    
+    # Book pattern (Author. Title. City: Publisher, Year)
+    book_pattern = r'^([^.]+)\.\s+([^.]+)\.\s+([^:]+):\s+([^,]+),\s+(\d{4})'
+    if re.match(book_pattern, citation_text):
+        match = re.match(book_pattern, citation_text)
+        result['type'] = 'book'
+        result['components'] = {
+            'author': match.group(1),
+            'title': match.group(2),
+            'city': match.group(3),
+            'publisher': match.group(4),
+            'year': match.group(5)
+        }
+        result['confidence'] = 0.9
+        return result
+    
+    # Journal article pattern
+    journal_pattern = r'^([^.]+)\.\s+"([^"]+)"\s+([^,]+),?\s+(?:vol\.\s+)?(\d+)'
+    if re.search(journal_pattern, citation_text):
+        match = re.search(journal_pattern, citation_text)
+        result['type'] = 'journal'
+        result['components'] = {
+            'author': match.group(1),
+            'title': match.group(2),
+            'journal': match.group(3),
+            'volume': match.group(4)
+        }
+        result['confidence'] = 0.85
+        return result
+    
+    # Website pattern
+    if 'http' in citation_text.lower() or 'www.' in citation_text:
+        result['type'] = 'website'
+        result['confidence'] = 0.8
+        
+        # Try to extract URL
+        url_pattern = r'(https?://[^\s]+|www\.[^\s]+)'
+        url_match = re.search(url_pattern, citation_text)
+        if url_match:
+            result['components']['url'] = url_match.group(1)
+        
+        # Try to extract access date
+        date_pattern = r'[Aa]ccessed\s+([^.]+)'
+        date_match = re.search(date_pattern, citation_text)
+        if date_match:
+            result['components']['access_date'] = date_match.group(1)
+        
+        return result
+    
+    # Legal citation pattern
+    if ' v. ' in citation_text or ' v ' in citation_text:
+        result['type'] = 'legal'
+        result['confidence'] = 0.75
+        return result
+    
+    # Interview/personal communication
+    if any(word in citation_text.lower() for word in ['interview', 'personal communication', 'email', 'conversation']):
+        result['type'] = 'personal'
+        result['confidence'] = 0.7
+        return result
+    
+    return result
+
+def format_citation_cms(citation_data, citation_type='note'):
+    """Format citation according to Chicago Manual of Style"""
+    components = citation_data.get('components', {})
+    cit_type = citation_data.get('type', 'unknown')
+    
+    if cit_type == 'book':
+        author = components.get('author', '')
+        title = components.get('title', '')
+        city = components.get('city', '')
+        publisher = components.get('publisher', '')
+        year = components.get('year', '')
+        
+        if citation_type == 'note':
+            # First note format
+            return f"{author}, {title} ({city}: {publisher}, {year})"
+        else:
+            # Bibliography format
+            return f"{author}. {title}. {city}: {publisher}, {year}."
+    
+    elif cit_type == 'journal':
+        author = components.get('author', '')
+        title = components.get('title', '')
+        journal = components.get('journal', '')
+        volume = components.get('volume', '')
+        
+        if citation_type == 'note':
+            return f"{author}, \"{title},\" {journal} {volume}"
+        else:
+            return f"{author}. \"{title}.\" {journal} {volume}."
+    
+    elif cit_type == 'website':
+        url = components.get('url', '')
+        access_date = components.get('access_date', '')
+        
+        formatted = citation_data.get('text', '')
+        if access_date and 'accessed' not in formatted.lower():
+            formatted += f" Accessed {access_date}."
+        
+        return formatted
+    
+    # Default: return original
+    return citation_data.get('text', '')
+
+def apply_citation_style(citations, style='chicago'):
+    """Apply formatting style to all citations"""
+    formatted_citations = []
+    
+    for citation in citations:
+        citation_info = identify_citation_type(citation['text'])
+        citation_info['text'] = citation['text']
+        citation_info['id'] = citation['id']
+        
+        if style == 'chicago':
+            formatted_text = format_citation_cms(citation_info, 'note')
+        else:
+            formatted_text = citation['text']  # Default to original
+        
+        formatted_citations.append({
+            'id': citation['id'],
+            'original': citation['text'],
+            'formatted': formatted_text,
+            'type': citation_info['type'],
+            'confidence': citation_info.get('confidence', 0)
+        })
+    
+    return formatted_citations
+
+def create_formatted_docx(original_path, formatted_citations, output_path, docx_structure):
+    """Create new DOCX with formatted citations while preserving all styles"""
+    temp_output = tempfile.mkdtemp()
     
     try:
-        # Check file size
-        is_large, size_mb = check_file_size(input_path)
+        # Copy all files from original
+        shutil.copytree(docx_structure['temp_dir'], temp_output, dirs_exist_ok=True)
         
-        # Extract docx
-        with zipfile.ZipFile(input_path, 'r') as z:
-            z.extractall(temp_dir)
+        # Update endnotes.xml with formatted citations
+        endnotes_path = os.path.join(temp_output, 'word', 'endnotes.xml')
         
-        doc_path = temp_dir / 'word' / 'document.xml'
-        endnotes_path = temp_dir / 'word' / 'endnotes.xml'
-        
-        # Check for endnotes
-        if not endnotes_path.exists():
-            return False, "No endnotes found in this document."
-        
-        if is_large or size_mb > 10:
-            # Use streaming for large files
-            logger.info(f"Processing large file ({size_mb:.1f} MB) in streaming mode...")
-            contexts, endnotes_text = process_large_document_streaming(
-                doc_path, endnotes_path, word_count
-            )
+        if os.path.exists(endnotes_path) and formatted_citations:
+            with open(endnotes_path, 'r', encoding='utf-8') as f:
+                endnotes_content = f.read()
             
-            # Process citations in chunks
-            if apply_cms:
-                processed_notes = process_in_chunks(endnotes_text, chunk_size=100)
-            else:
-                processed_notes = endnotes_text
-            
-            # Build output (simplified for large files)
-            success = build_output_streaming(
-                temp_dir, contexts, processed_notes, format_bold
-            )
-            
-            if success:
-                # Repack docx
-                with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as z:
-                    for file_path in temp_dir.rglob('*'):
-                        if file_path.is_file():
-                            z.write(file_path, file_path.relative_to(temp_dir))
+            # Replace each citation text while preserving XML structure
+            for citation in formatted_citations:
+                # Find the endnote by ID
+                pattern = f'<w:endnote[^>]*w:id="{citation["id"]}"[^>]*>(.*?)</w:endnote>'
+                match = re.search(pattern, endnotes_content, re.DOTALL)
                 
-                note_count = len(contexts)
-                return True, f"Successfully converted {note_count} notes ({size_mb:.1f} MB file)"
-            else:
-                return False, "Failed to build output document"
-        else:
-            # Use original method for smaller files
-            # ... (original convert_docx code for small files)
-            pass
+                if match:
+                    note_xml = match.group(1)
+                    
+                    # Extract all text nodes
+                    text_pattern = r'(<w:t[^>]*>)([^<]+)(</w:t>)'
+                    text_matches = list(re.finditer(text_pattern, note_xml))
+                    
+                    if text_matches:
+                        # Replace text content while preserving structure
+                        formatted_text = citation['formatted']
+                        
+                        # For simplicity, replace all text in first text node
+                        first_match = text_matches[0]
+                        new_xml = note_xml[:first_match.start()] + \
+                                 first_match.group(1) + formatted_text + first_match.group(3)
+                        
+                        # Remove other text nodes if multiple
+                        for match in reversed(text_matches[1:]):
+                            new_xml = new_xml[:match.start()] + new_xml[match.end():]
+                        
+                        # Update the endnotes content
+                        full_note = f'<w:endnote w:id="{citation["id"]}">{new_xml}</w:endnote>'
+                        endnotes_content = endnotes_content.replace(match.group(0), full_note)
             
-    except MemoryError:
-        logger.error("Out of memory - file too large")
-        return False, "File too large to process. Please split into smaller documents."
+            # Write updated endnotes
+            with open(endnotes_path, 'w', encoding='utf-8') as f:
+                f.write(endnotes_content)
         
-    except Exception as e:
-        logger.error(f"Processing error: {e}")
-        return False, str(e)
+        # Create the output DOCX
+        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(temp_output):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, temp_output)
+                    zipf.write(file_path, arcname)
+        
+        return True
         
     finally:
-        # Clean up
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        gc.collect()
+        # Cleanup
+        shutil.rmtree(temp_output, ignore_errors=True)
+        if docx_structure.get('temp_dir'):
+            shutil.rmtree(docx_structure['temp_dir'], ignore_errors=True)
 
+@app.route('/')
+def index():
+    return render_template('index.html')
 
-# FIX 7: Add timeout and size limits to Flask route
-from functools import wraps
-import signal
-
-def timeout(seconds):
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            def timeout_handler(signum, frame):
-                raise TimeoutError("Processing timeout - file too large")
-            
-            # Set timeout
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(seconds)
-            
-            try:
-                result = func(*args, **kwargs)
-            finally:
-                signal.alarm(0)  # Cancel alarm
-            
-            return result
-        return wrapper
-    return decorator
-
-
-@app.route('/convert', methods=['POST'])
-@timeout(300)  # 5 minute timeout
-def convert_with_timeout():
-    """
-    Convert route with timeout for large files
-    """
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    """Handle file upload and initial parsing"""
     if 'file' not in request.files:
-        return redirect(url_for('index'))
+        return jsonify({'error': 'No file provided'}), 400
     
     file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
     
-    # Check file size before saving
-    file.seek(0, 2)  # Seek to end
-    file_size = file.tell()
-    file.seek(0)  # Reset
+    if not allowed_file(file.filename):
+        return jsonify({'error': 'Invalid file type. Only .docx files are allowed'}), 400
     
-    if file_size > 100 * 1024 * 1024:  # 100MB limit
-        flash('File too large. Maximum size is 100MB.', 'error')
-        return redirect(url_for('index'))
+    # Save uploaded file
+    filename = secure_filename(file.filename)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    filename = f"{timestamp}_{filename}"
+    file_path = os.path.join(UPLOAD_FOLDER, filename)
+    file.save(file_path)
     
-    # Continue with normal processing...
-    # (rest of convert function)
+    try:
+        # Extract DOCX structure
+        docx_structure = extract_docx_structure(file_path)
+        
+        # Parse citations
+        citations = parse_citations(docx_structure['endnotes'])
+        
+        # Store in session for later processing
+        session['current_file'] = file_path
+        session['original_filename'] = file.filename
+        session['docx_structure'] = {
+            'document': docx_structure['document'][:1000],  # Store sample for preview
+            'endnotes': docx_structure['endnotes'][:1000],
+            'has_endnotes': bool(citations)
+        }
+        
+        # Clean up temp directory
+        if docx_structure.get('temp_dir'):
+            shutil.rmtree(docx_structure['temp_dir'], ignore_errors=True)
+        
+        # Analyze citations
+        citation_analysis = []
+        for citation in citations[:10]:  # Preview first 10
+            analysis = identify_citation_type(citation['text'])
+            citation_analysis.append({
+                'id': citation['id'],
+                'text': citation['text'][:200] + '...' if len(citation['text']) > 200 else citation['text'],
+                'type': analysis['type'],
+                'confidence': analysis['confidence']
+            })
+        
+        return jsonify({
+            'success': True,
+            'filename': file.filename,
+            'total_citations': len(citations),
+            'preview': citation_analysis
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
+@app.route('/format', methods=['POST'])
+def format_citations():
+    """Format citations with selected style"""
+    data = request.json
+    style = data.get('style', 'chicago')
+    
+    if 'current_file' not in session:
+        return jsonify({'error': 'No file uploaded'}), 400
+    
+    file_path = session['current_file']
+    
+    try:
+        # Re-extract structure
+        docx_structure = extract_docx_structure(file_path)
+        
+        # Parse all citations
+        citations = parse_citations(docx_structure['endnotes'])
+        
+        # Apply formatting
+        formatted_citations = apply_citation_style(citations, style)
+        
+        # Create output filename
+        output_filename = f"formatted_{style}_{session.get('original_filename', 'document.docx')}"
+        output_path = os.path.join(UPLOAD_FOLDER, output_filename)
+        
+        # Create formatted document
+        create_formatted_docx(file_path, formatted_citations, output_path, docx_structure)
+        
+        # Store output path in session
+        session['output_file'] = output_path
+        session['output_filename'] = output_filename
+        
+        return jsonify({
+            'success': True,
+            'formatted_count': len(formatted_citations),
+            'download_ready': True
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-# Additional helper functions
-def extract_incipit_at_position(text, position, word_count):
-    """Helper function for incipit extraction"""
-    text_before = text[:position]
-    if not text_before:
-        return ""
+@app.route('/download')
+def download_formatted():
+    """Download formatted document"""
+    if 'output_file' not in session:
+        return jsonify({'error': 'No formatted file available'}), 400
     
-    # Find sentence start
-    sentence_markers = ['. ', '? ', '! ']
-    sentence_start = 0
+    output_path = session['output_file']
+    output_filename = session.get('output_filename', 'formatted_document.docx')
     
-    for marker in sentence_markers:
-        pos = text_before.rfind(marker)
-        if pos > sentence_start:
-            sentence_start = pos + len(marker)
+    if not os.path.exists(output_path):
+        return jsonify({'error': 'File not found'}), 404
     
-    sentence = text_before[sentence_start:].strip()
-    words = sentence.split()[:word_count]
-    
-    if words:
-        # Clean last word
-        words[-1] = re.sub(r'[.,;:!?"\'"]+$', '', words[-1])
-    
-    return ' '.join(words)
+    return send_file(
+        output_path,
+        mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        as_attachment=True,
+        download_name=output_filename
+    )
 
+@app.route('/analyze', methods=['POST'])
+def analyze_citations():
+    """Deep analysis of citations"""
+    if 'current_file' not in session:
+        return jsonify({'error': 'No file uploaded'}), 400
+    
+    file_path = session['current_file']
+    
+    try:
+        # Extract and parse
+        docx_structure = extract_docx_structure(file_path)
+        citations = parse_citations(docx_structure['endnotes'])
+        
+        # Analyze all citations
+        analysis_results = {
+            'total': len(citations),
+            'types': {},
+            'confidence_levels': {
+                'high': 0,
+                'medium': 0, 
+                'low': 0
+            },
+            'detailed': []
+        }
+        
+        for citation in citations:
+            analysis = identify_citation_type(citation['text'])
+            
+            # Count by type
+            cit_type = analysis['type']
+            analysis_results['types'][cit_type] = analysis_results['types'].get(cit_type, 0) + 1
+            
+            # Count by confidence
+            conf = analysis['confidence']
+            if conf >= 0.8:
+                analysis_results['confidence_levels']['high'] += 1
+            elif conf >= 0.6:
+                analysis_results['confidence_levels']['medium'] += 1
+            else:
+                analysis_results['confidence_levels']['low'] += 1
+            
+            # Store detailed info
+            analysis_results['detailed'].append({
+                'id': citation['id'],
+                'type': cit_type,
+                'confidence': conf,
+                'components': analysis.get('components', {})
+            })
+        
+        # Clean up
+        if docx_structure.get('temp_dir'):
+            shutil.rmtree(docx_structure['temp_dir'], ignore_errors=True)
+        
+        return jsonify(analysis_results)
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-def build_output_streaming(temp_dir, contexts, processed_notes, format_bold):
-    """Build output document using streaming approach"""
-    # Implementation would modify XML files directly
-    # rather than loading entire tree into memory
-    pass
+@app.route('/clear', methods=['POST'])
+def clear_session():
+    """Clear session and uploaded files"""
+    # Clean up files
+    if 'current_file' in session and os.path.exists(session['current_file']):
+        os.remove(session['current_file'])
+    
+    if 'output_file' in session and os.path.exists(session['output_file']):
+        os.remove(session['output_file'])
+    
+    # Clear session
+    session.clear()
+    
+    return jsonify({'success': True})
+
+if __name__ == '__main__':
+    app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
